@@ -25,6 +25,8 @@
 
 // Port pin usage
 #define P1_SW_OFF 1
+#define P1_LED 2
+#define P1_UNUSED 4 // P1.2 = 4 reserved in case serial is used
 #define P1_SW_ON 8
 #define P1_TRIGGER 0x10
 #define P1_TRIAC 0x20
@@ -49,25 +51,31 @@ __cc_version2 unsigned short mult(unsigned short a, unsigned short b);
 static unsigned char state = STATE_INITIAL; // Current operating mode
 
 // Variables for phase control based on timer A cycles
-static char zcmode; // Zero crossing detector state
-static unsigned short hperiod; // Half of AC period
-static unsigned short zerocross; // TAR value corresponding to zero crossing
+static char zcmode;                   // Zero crossing detector state
+static unsigned short hperiod;        // Half of AC period
+static unsigned short zerocross;      // TAR value for zero crossing
 static unsigned short triacdelay = 0; // Delay after zero crossing
+                                      // Zero disables TRIAC driver
 
 // Variables for linear dimming
-static unsigned short dimpower = 0; // Current light output
-static bool updatedim; // dimpower updated, calculations needed to update dim
+static unsigned short dimpower = 0;  // Set by fading code in ISR, used by
+                                     // main code to calculate triacdelay.
+static bool updatedim;               // Set by ISR when dimpower updated,
+                                     // used to ensure requested value is set.
 static unsigned short dimtarget = 0; // Target for current fade
-static unsigned short dimdelta = 0; // Light output change per 1/60s
+static unsigned short dimdelta = 0;  // Light output change per AC cycle
 
 // Variables for user input
-static unsigned short potavg = 0; // Averaged potentiometer value
+static unsigned short potavg = 0;           // Averaged potentiometer value
 static unsigned char debctr = DEBOUNCE_LEN; // Switch debounce counter
-static unsigned char inputval;
+                                            // Set to DEBOUNCE_LEN after bounce
+                                            // Decremented once per AC cycle
+                                            // until zero when debouncing ends
+static unsigned char inputval = 0xFF;       // Previous input, for debouncing
 
 /*** State descriptors ***/
 
-// Map from state to dimming target address
+// Map from state to dimming target value
 static const unsigned s2dimtarg[] = { 0, 0, TRIGDIMTARGET, 0 };
 // Map from state to dimming step
 static const unsigned short s2dimstep[] = { 0xFFFF-DIMSPEED+1,
@@ -133,15 +141,21 @@ __interrupt void TACCR1_ISR(void)
 
             // Update zero crossing time if needed
             if (triacdelay > 0) {
-                unsigned short delta = zerocross - t1;
+                unsigned short delta;
+
+                /* Turn on indicator LED so it truly indicates TRIAC is active.
+                 * This will indicate if any bug is wasting power by
+                 * keeping the lamp on at very low levels. */
+                P1OUT |= P1_LED;
+
+                delta = zerocross - t1;
                 zerocross = t1;
                 if (delta > t2) delta = -delta;
-                if (delta > t2) {
+                if (delta > t2 || (TACCTL0&CCIE) == 0) {
                     /* This is used in two cases:
                      * - Dimming ISR already set up next interrupt based on
                      *   old zero crossing time. Update it based on new time.
-                     * - TRIAC interrupt is disabled. It is enabled, possibly
-                     *   with one extra AC cycle delay. */
+                     * - TRIAC interrupt is disabled. It is enabled. */
                     zerocross += hperiod;
                     TACCR0 = zerocross + triacdelay;
                     TACCTL0 = OUTMOD_1 | CCIE;
@@ -281,6 +295,7 @@ __interrupt void TACCR1_ISR(void)
             } // if (dimdelta != 0 && !adc10start)
 
             /*** Wake main thread ***/
+            // Use of updatedim ensures that last fade value is actually set
             if (updatedim) {
                 __bic_SR_register_on_exit(LPM4_bits);
             }
@@ -385,21 +400,28 @@ int main( void )
     // Stop watchdog timer to prevent time out reset
     WDTCTL = WDTPW + WDTHOLD;
 
-    // Set DCOCLK to 1 MHz.
+    // Set up DCO
     DCOCTL = 0x00;          // Errata BCL12
     BCSCTL1 = CALBC1_1MHZ;
-    DCOCTL = CALDCO_1MHZ;
+    // DCOx is 1 more than 1Mhz calibrated value
+    // MODx is 0 to prevent jitter
+    DCOCTL = (CALDCO_1MHZ & (DCO0|DCO1|DCO2)) + DCO0;
 
-    /*** Set up port 1 ***/
+    /*** Set up ports ***/
+    P1OUT = P1_SW_ON | P1_SW_OFF | P1_TRIGGER;
+    P1DIR = P1_TRIAC | P1_LED;
     // Trigger uses external pullup
-    P1OUT = P1_SW_ON | P1_SW_OFF;
-    P1DIR = P1_TRIAC;
-    P1REN = P1_SW_ON | P1_SW_OFF;
+    P1REN = P1_SW_ON | P1_SW_OFF | P1_TRIGGER | P1_UNUSED;
     P1SEL = P1_TRIAC | P1_ZEROCROSS;
     ADC10AE0 = P1_POT;
 
-    /*** Set up ADC ***/
-    // FIXME
+    // Port 2 as GPIO because XIN and XOUT are unused
+    P2SEL = 0;
+    P2OUT = 0;
+    P2REN = 0xFF;
+
+    // RST/NMI needs 47 kohm pullup with 10 nF (or for 2.2 nF SBW) pulldown
+    // TEST can remain open
 
     /*** Set up timer A ***/
     // TA0: SMCLK/1, continuous
@@ -420,6 +442,9 @@ int main( void )
         } else {
             // Unlit, waiting for trigger or switch
 
+            // LED off here, ensuring it can't remain off while TRIAC is on
+            P1OUT &= ~P1_LED;
+
             // Disable timer interrupts.
             // Only port interrupts can exit this state.
             TACCTL0 = OUTMOD_0; // Also turn off TRIAC driver
@@ -436,17 +461,22 @@ int main( void )
             // TRIAC driver is turned on by zero crossing detector ISR
         }
 
-        // Avoid glitches if dimpower is changed by interrupt
-        __disable_interrupt();
-        curdimpower = dimpower;
-        updatedim = false;
-        __enable_interrupt();
-        // Find table index
-        unsigned short dimidx = curdimpower >> (16 - DIMTAB_BITS);
-        // Linearly interpolate and scale based on current period
-        triacdelay = mult(dimtab[dimidx] -
-                          mult(dimtab[dimidx]-dimtab[dimidx+1],
-	                       curdimpower << DIMTAB_BITS),
-                          hperiod);
-    }
-}
+        // Don't inadvertently turn on TRIAC
+        if (state > STATE_TRIGWAIT || curdimpower != 0) {
+            /*** Convert linearized dimming power to TRIAC delay */
+            // Avoid glitches if dimpower is changed by interrupt
+            __disable_interrupt();
+            curdimpower = dimpower;
+            updatedim = false;
+            __enable_interrupt();
+
+            // Find table index
+            unsigned short dimidx = curdimpower >> (16 - DIMTAB_BITS);
+            // Linearly interpolate and scale based on current period
+            triacdelay = mult(dimtab[dimidx] -
+                              mult(dimtab[dimidx]-dimtab[dimidx+1],
+                                   curdimpower << DIMTAB_BITS),
+                              hperiod);
+        }
+    } // while(1)
+} // main()
